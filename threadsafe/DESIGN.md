@@ -23,12 +23,13 @@ be compatible with existing software, addresses returned should be aligned to
 
 ### Usage
 
-The algorithm uses buffers, one is a queue (the free list) and the buffer is
-similar to a linked list. The usage behaviour is IPC mechanisms that require
-tracing. The IPC would allocate lots of small chunks of memory, and there could
-be many IPC channels allocating memory. The transmission of IPC to another
-process might occur very quickly, such that the memory cannot be freed yet,
-until the IPC data is traced.
+The algorithm uses two buffers: one is a queue (managing arbitrary buffer chunk
+sizes from a larger buffer) implemented as an array; and a buffer where chunks
+of memory are allocated from, similar to a linked list. The usage behaviour is
+IPC mechanisms that require tracing. The IPC would allocate lots of small chunks
+of memory, and there could be many IPC channels allocating memory. The
+transmission of IPC to another process might occur very quickly, such that the
+memory cannot be freed yet, until the IPC data is traced.
 
 The IPC tracing mechanism occurs in an ordered fashion. For a single IPC
 mechanism, it will always free in the order that memory is allocated. As there
@@ -50,37 +51,38 @@ the time for allocation (very fast) and free.
 
 ## Datastructures Used
 
-Two datastructures are used. Both are fixed in size. One is a small "free" list
-(implemented as a circular queue of an array), the other is a buffer
-(implemented as a circular queue of arbitrary byte-sized buffers).
+Two datastructures are used.
 
-The *List* contains a list of all allocated and returned blocks given to the
-user. The most important property of the list is it consists of fixed size
+The *ListQueue* contains a list of all allocated and returned blocks given to
+the user. The most important property of the list is it consists of fixed size
 elements, and unallocated entries are of well defined values.
 
-The *Buffer* is still a datastructure, can be allocated in a different memory
-region and all pointers returned by `alloc` are within this region.
+The *BufferQueue* is typically much larger, can be allocated in a different
+memory region and all pointers returned by `alloc` are within this region.
 
 ### Summary
 
-The diagram gives an overview of the datastructures:
+The diagram gives an overview of the relationship between the two
+datastructures:
 
  ![](./figures/Buffer_ListEntry.png)
 
 To summarize:
 
-* A `ListEntry` points to the offset in a the *Buffer*. It has a reverse entry
-  to `ListEntry` to make it easier to find when freeing.
-* A `ListEntry` is changed atomically and has four states: in allocation (ZERO);
-  failed allocation; allocated; and ready for free. Because of this, the array
-  of `ListEntry` elements is like a free list, it is used when freeing.
-  * This is critical to this design, that each element is default ZERO and of
-    fixed size, else atomic updates can't be made.
+* A `ListQueue` is a circular queue of elements of type `ListEntry`.
+* A `ListEntry` points to the offset in a the `BufferQueue`. It has a reverse
+  entry to a `ListEntry` to make it easier to find when freeing a buffer and
+  updating the `ListQueue`.
+* A `ListEntry` is changed atomically and has four states: in allocation or in
+  free (ZERO); allocated; and ready for free (or failed allocation). Because of
+  this, the array of `ListEntry` elements similar to a free list.
+  * Critical to this design is that each element is default ZERO and is of fixed
+    size, else atomic updates can't be made.
 * A `ListEntry` works because the default state is ZERO, so we just need to
   update the `ListQueue` and it's automatically in the "in allocation" state to
   guard against unwanted frees.
-* The `Buffer` is also a queue. We only allow memory to be returned when the
-  tail is free.
+* The `BufferQueue` is also a queue. We only allow memory to be returned when
+  the tail is free.
 * The `BufferBlock` is at the beginning of every *block*. Because everything
   between the `buffer_queue.tail` and `buffer_queue.length` is allocated, this
   forms a linked list type structure, with lengths to get to the next block
@@ -101,9 +103,9 @@ typedef struct __attribute__((__packed__)) _ListEntry {
 } ListEntry;
 ```
 
-The datastructure supports a *Buffer* of size of up to 32-bits aligned on
+The datastructure supports a *BufferQueue* of size of up to 32-bits aligned on
 16-byte boundaries. It is compacted such that 28-bits multiplied by 16-byte
-boundaries is 32-bit in size. By using such a compression mechansism we can:
+boundaries is 32-bit in size. By using such a compression mechanism we can:
 
 * Support up to 4GB for each memory pool
 * Do atomic compares and exchanges for 8-bytes so that updates can be made
@@ -116,17 +118,18 @@ The `flags` consists of one-bit:
 
 The cases for interpreting the `ListEntry` for the datastructure:
 
-* All ZERO. Indicates that the entry has an active allocation on-going
-* `length` == 0, with `flags.free` == 1, indicates this was a
-  failed allocation and on reclaim can be freed. That the length is zero
-  indicates no entry in the *Buffer* exists.
+* All ZERO. Indicates that the entry has an active allocation or an active free
+  on-going.
 * `length` != 0, with `flags.free` == 0, indicates the allocation is in use and
   is not freed.
 * `length` != 0, with `flags.free` == 1, indicates the allocation has been
   freed, but still takes memory.
+* `length` == 0, with `flags.free` == 1, indicates this was a
+  failed allocation and on reclaim can be freed. That the length is zero
+  indicates no entry in the *Buffer* exists.
 
-The *List* is modelled as a circular queue, but the enqueue and dequeue routines
-do not exist, and are customly implemented by the `free()` method.
+The *ListQueue* is modelled as a circular queue, but the enqueue and dequeue
+routines do not exist, and are custom implemented by the `free()` method.
 
 The structure for the queue is:
 
@@ -146,10 +149,11 @@ atomic.
 
 ### The Buffer
 
-The *Buffer* is a large region of memory. Each offset into the buffer returned
-to the user should be aligned to 16-bytes. At the start of each *block* in
-memory, there will be a small management region of 16-bytes (not all of this is
-used, by alignment dictates this is the smallest size).
+The *BufferQueue* is a large region of memory. Each offset into the buffer
+returned to the user should be aligned to 16-bytes. At the start of each *block*
+in memory, there will be a small management region of 16-bytes (not all of this
+is used, by alignment dictates this is the smallest size). This management
+region of 16-bytes is the `BufferBlock`.
 
 ```c
 typedef struct __attribute__((__packed__)) _BufferBlock {
@@ -159,11 +163,12 @@ typedef struct __attribute__((__packed__)) _BufferBlock {
 ```
 
 When a *block* is allocated, the `list_entry_offset` points to the index number
-into the array of `ListEntry` elements. For lock-less behaviour, it is expected
-that this datastructure is 8 bytes or less.
+into the array of `ListEntry` elements. This update must occur atomically, and
+so is expected to be 8 bytes or less.
 
-The *Buffer* is modeled as a queue of *blocks*, where blocks are assumed
-allocated from the tail until the head. The data-structure for the *Buffer* is:
+The *BufferQueue* is modeled as a queue of *blocks*, where blocks are assumed
+allocated from the tail until the head. The data-structure for the *BufferQueue*
+is:
 
 ```c
 typedef struct __attribute__((__packed__)) _BufferQueue {
@@ -200,6 +205,13 @@ Similarly, we have:
   L<sub>B</sub> >= N<sub>B</sub>; is the maximum free contiguous memory region
   available.
 
+To visually see these values within the *BufferQueue*:
+
+ ![](./figures/buffer1.png)
+
+The *grey* area represents unavailable memory for new allocations, and new
+*blocks* are allocated after H<sub>B</sub>.
+
 ### Allocation
 
 The allocation routine must support multiple threads calling `alloc(uint32_t
@@ -208,43 +220,49 @@ see that it must handle also thread-safe behaviour with `free()`.
 
 Sequence of Steps for an allocation for the size of bytes `size`.
 
-* Allocate a new entry at the end of *List*
-  * We know that the default values that are not allocated are ZERO. We use this
-    later to exploit in the `free` algorithm.
-  * Do this in a lockless way. Take an atomic copy of `list_queue`.
-  * Increment L<sub>L</sub>. If it exceeds the boundaries, then return `NULL`
-    that there is not enough space to allocate.
-  * Do a compare/exchange. If the value of `list_queue` has changed, repeat.
-  * NOTE: Now we've allocated space in our *List* which will be used for freeing
-    memory later.
-* Allocate a *block* in the *Buffer*.
+* Allocate a new entry at the end of *ListQueue*
+  * We know that the default values that are not allocated are ZERO. This
+    indicates to the *free* algorithm later that the region of memory is still
+    in use.
+  * Increment L<sub>L</sub> of the *ListQueue* element in a lockless fashion.
+    * Take an atomic copy of `list_queue`.
+    * Increment L<sub>L</sub>. If it exceeds the boundaries, N<sub>L</sub>, then
+      return `NULL` that there is not enough space to allocate.
+    * Do a compare/exchange. If the value of `list_queue` has changed, repeat.
+  * NOTE: Now we've allocated space in our *ListQueue* which will be used for
+    freeing memory later. It is still ZERO.
+* Allocate a *block* in the *BufferQueue*.
   * NOTE: The contents of the buffer are undefined and cannot be relied upon.
+    This is why we need to have the *ListQueue* array where memory is well
+    defined in all states.
   * Take an atomic copy of `buffer_queue`.
   * Define `nsize` as `align(size, alignment) + min(sizeof(BufferBlock),
     alignment)` where `alignment` is 16-bytes. `nsize` is then the buffer data
     we want to allocate (moved up to the next 16-byte alignment) plus a 16-byte
-    region for free optimisations.
+    region for the management region `BufferBlock`.
   * Check that it is possible to allocate `nsize` bytes contiguously from
     H<sub>B</sub>.
-    * If N<sub>B</sub> - L<sub>B</sub> < `nsize`, we have insufficient memory,
-      then return `NULL`.
-      * Before returning `NULL`, it might be attempted that a rollback on
-        `ListEntry` is made, which is only possible, if no new allocations have
-        been done in-between. This step is an optimisation and is completely
-        optional for the algorithm.
-      * If the rollback is not done (or failed), atomically set the entry with
-        `length` of zero and `flags.free` is set. This will tell the `free`
-        routine that the entry in the *List* is free without needing to update
-        the *Buffer* metadata.
-    * e.g. if T<sub>B</sub> + L<sub>B</sub> < N<sub>B</sub>, then if
-      N<sub>B</sub> < `nsize` we must handle the case that we need to roll-over
-      to the next contiguous region. That is, F<sub>B</sub> < `nsize`.
-      * `nsize += F_B`. Like in the previous step, ensure we have enough memory,
-        if not, return `NULL` after updating the *List* data structure, like in
-        the previous step.
+    * If N<sub>B</sub> - L<sub>B</sub> < `nsize`, we have insufficient memory
+      (¹), then return `NULL` (²).
+      * (³) As the allocation failed, atomically set the current `ListEntry` with
+        `length` of zero (no space in the `BufferQueue` is consumed) and
+        `flags.free` is set. This will tell the `free` routine that the entry in
+        the *List* is free without needing to update the *BufferQueue* metadata.
+    * if T<sub>B</sub> + L<sub>B</sub> < N<sub>B</sub>, then if F<sub>B</sub> <
+      `nsize` we must handle the case that we need to roll-over to the next
+      contiguous region.
+      * Like in the previous step, ensure we have enough space to allocate a
+        *block* from the start of the *BufferQueue* (¹). That is, `nsize` <
+        T<sub>B</sub>. If not, return `NULL` (²).
+      * `nsize += F_B`. This ensures that L<sub>B</sub> is incremented properly
+        as the last step. The allocation of the `BufferBlock` management region
+        is covered later, once the *BufferQueue* and *ListQueue* are allocated.
+        We're still safe from a `free` touching undefined management data in the
+        *BufferQueue* because the `ListEntry` is still ZERO.
     * If T<sub>B</sub> + L<sub>B</sub> >= N<sub>B</sub>, it is guaranteed that
       the free space in the buffer is contiguous as there is no wrap-around. If
-      F<sub>B</sub>. Ensure that `nsize` < F<sub>B</sub>.
+      F<sub>B</sub>. Ensure that `nsize` < F<sub>B</sub> (¹). If it isn't then
+      return `NULL` (²).
   * Increment L<sub>B</sub> by `nsize`. Atomically update `buffer_queue` with a
     compare/exchange ensuring that the value hasn't change since the initial
     read. If the value has changed, another allocation has occurred in-between
@@ -284,6 +302,26 @@ Sequence of Steps for an allocation for the size of bytes `size`.
     atomically.
     * The datastructures are complete. Note that this block still cannot be
       freed until the `alloc()` routine returns.
+
+Notes
+
+* (¹) We are checking that we have a buffer free. We can also do a more
+  complicated step first, that we don't need to do the second space check:
+  * If T<sub>B</sub> + L<sub>B</sub> < N<sub>B</sub>, then if F<sub>B</sub> <
+    `nsize`, AND T<sub>B</sub> < `nsize` we can return NULL.
+    * This comes about because we're looking to see if we can fit the allocation
+      at the end, if not, we try to see if we can fit the allocation at the
+      start. If not, then we can't allocate.
+  * Else, if N<sub>B</sub> - L<sub>B</sub> < `nsize` we can return `NULL`.
+  * By doing the complete upfront, the checks don't need to be done again later,
+    but there is a little more CPU time as we do two checks always, instead of
+    the second check only 50% of the time.
+* (²) Before returning `NULL`, it might be possible to revert the increment of
+  the *ListQueue* by removing the recently added entry (decrementing the length
+  while keeping the tail constant). Attempt the revert (only if the head of
+  *ListQueue* hasn't change state since the check) while the `ListEntry` is
+  still ZERO. It would need to be done atomically with a compare/exchange and
+  always checked inside the loop that the head hasn't changed.
 
 ### Free
 
