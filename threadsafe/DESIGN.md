@@ -242,6 +242,12 @@ Sequence of Steps for an allocation for the size of bytes `size`.
     region for the management region `BufferBlock`.
   * Check that it is possible to allocate `nsize` bytes contiguously from
     H<sub>B</sub>.
+    * If L<sub>B</sub> is zero, we can optimise and prevent a potential fail
+      allocation. The fail allocation could occur if `nsize` > F<sub>B</sub>.
+      * Set T<sub>B</sub> to zero, and L<sub>B</sub> to `nsize` (assuming that
+        N<sub>B</sub> > `nsise`).
+      * Automatically update `buffer_queue` with a compare/exchange ensuring the
+        value hasn't changed since the initial read.
     * If N<sub>B</sub> - L<sub>B</sub> < `nsize`, we have insufficient memory
       (¹), then return `NULL` (²).
       * (³) As the allocation failed, atomically set the current `ListEntry` with
@@ -249,32 +255,28 @@ Sequence of Steps for an allocation for the size of bytes `size`.
         `flags.free` is set. This will tell the `free` routine that the entry in
         the *List* is free without needing to update the *BufferQueue* metadata.
     * if T<sub>B</sub> + L<sub>B</sub> < N<sub>B</sub>, then if F<sub>B</sub> <
-      `nsize` we must handle the case that we need to roll-over to the next
+      `nsize` we must handle the case that we need to wrap-around to the next
       contiguous region.
       * Like in the previous step, ensure we have enough space to allocate a
         *block* from the start of the *BufferQueue* (¹). That is, `nsize` <
         T<sub>B</sub>. If not, return `NULL` (²).
-      * `nsize += F_B`. This ensures that L<sub>B</sub> is incremented properly
-        as the last step. The allocation of the `BufferBlock` management region
-        is covered later, once the *BufferQueue* and *ListQueue* are allocated.
-        We're still safe from a `free` touching undefined management data in the
-        *BufferQueue* because the `ListEntry` is still ZERO.
     * If T<sub>B</sub> + L<sub>B</sub> >= N<sub>B</sub>, it is guaranteed that
-      the free space in the buffer is contiguous as there is no wrap-around. If
-      F<sub>B</sub>. Ensure that `nsize` < F<sub>B</sub> (¹). If it isn't then
-      return `NULL` (²).
-  * Increment L<sub>B</sub> by `nsize`. Atomically update `buffer_queue` with a
-    compare/exchange ensuring that the value hasn't change since the initial
-    read. If the value has changed, another allocation has occurred in-between
-    and the step must be repeated.
-* Now both the index in *List* and the region in *Buffer* are allocated. The
-  `ListEntry` having a value of ZERO indicates that an allocation is in
-  progress.
-  * Write the metadata in the *block* in *Buffer* so that when the user calls
-    `free(addr)`, we can identify quickly the `ListEntry`. It is advisable to do
-    this first, as the `free()` routine will not see this block until we're
-    done. But so long as the `ListEntry` indicates `flag.free == 0`, this is
-    only an extra protection.
+      the free space in the buffer is contiguous as there is no wrap-around.
+      Ensure that `nsize` < F<sub>B</sub> (¹). If it isn't then return `NULL`
+      (²).
+  * Increment L<sub>B</sub> by `nsize`, and if wrap-around, again by
+    F<sub>B</sub>. Atomically update `buffer_queue` with a compare/exchange
+    ensuring that the value hasn't changed since the initial read. If the value
+    has changed, another allocation has occurred in-between and the step must be
+    repeated.
+* Now both the index in *ListQueue* and the region in *BufferQueue* are
+  allocated. The `ListEntry` having a value of ZERO indicates that an allocation
+  is in progress.
+  * Write the management region to the *block* in *BufferQueue* so that when the
+    user calls `free(addr)`, we can identify quickly the `ListEntry`. It is
+    advisable to do this first, as the `free()` routine will not see this block
+    until we're done. But so long as the `ListEntry` indicates `flag.free == 0`,
+    this is only an extra protection.
     * In case of no wrap-around, typecast the start of the *block* to
       `BufferBlock` and set `list_entry_offset` to the start of the *block*, and
       `block_length` to be `nsize`. The address we return will be immediately
@@ -283,18 +285,15 @@ Sequence of Steps for an allocation for the size of bytes `size`.
       first will be used as a gap, which is used later by `free()` to ensure the
       tail is properly incremented. The second is the *block* containing the
       memory region the user will get from the return of this call.
-      * Typecast the start of the *block* to `BufferBlock` and set the
-        `list_entry_offset` to -1, and the `block_length` to the space from the
-        current position until the end of the buffer. This indicates there is no
-        `ListEntry` and a free can reclaim this region when the previous block
-        is free.
-        * Note, there is a special use case that if there are no previously
-          allocated blocks, we can atomically update the `buffer_queue` so that
-          the tail and the length point to the beginning of the buffer. This is
-          an optimisation for memory usage and doesn't change the algorithm.
-      * Typecast a second `BufferBlock` from the offset 0 of *Buffer* and set
-        `list_entry_offset` for this block. The address we return will be
-        immediately after the `BufferBlock` (e.g. index 16 of the byte array
+      * Typecast the start of the first *block* (represented by F<sub>B</sub>)
+        to `BufferBlock` and set the `list_entry_offset` to -1, and the
+        `block_length` to the space from the current position until the end of
+        the buffer (i.e. F<sub>B</sub>). The `list_entry_offset` indicates there
+        is no `ListEntry` and a free can reclaim this region when the previous
+        block is free.
+      * Typecast a second `BufferBlock` from the offset zero of *BufferQueue*
+        and set `list_entry_offset` for this block. The address we return will
+        be immediately after the `BufferBlock` (e.g. index 16 of the byte array
         *Buffer*). The `free` function must be able to find the `BufferBlock`
         when given only the address returned by the `alloc` function.
   * Update the `ListEntry` with the offset of the *block* with the matching
