@@ -324,10 +324,13 @@ Notes
 
 ### Free
 
-The free routine is simpler, and uses the *List* to iterate through all *blocks*
-in *Buffer* which are no longer needed, incrementing the tail (and thus
-decrementing the length) effectively allowing memory to be reused in the
-*Buffer*.
+The free routine is simpler, and uses the *ListQieie* to iterate through all
+*blocks* in *BufferQueue* which are no longer needed, incrementing the tail (and
+thus decrementing the length) effectively allowing memory to be reused in the
+*BufferQueue*.
+
+It is intended to be very fast that memory is freed in the approximate order
+that memory is allocated.
 
 Note, it is illegal to free memory which has already been freed or which has not
 been allocated, i.e. it is only allowed to call `free` exactly once for one
@@ -339,16 +342,20 @@ Given an address, which is returned by `alloc(size)`:
   may only occur once.
   * Subtract 16 bytes, which is `min(sizeof(BufferBlock), alignment)` bytes,
     from the address. Typecast this to `BufferBlock` and obtain the offset into
-    *List* which is a `ListEntry`.
-  * Update the `ListEntry` so that `flag.free == 1`. Note that the
-    `ListEntry.length` must always be non-zero. If it is zero, then there is an
-    error in the implementation, or the user called an invalid address.
-* The next step is to iterate over the *List* updating the tail of the *Buffer*
-  T<sub>B</sub> and the length L<sub>B</sub> as the *List* is enumerated.
-  * From the tail of *List*, get the *ListEntry*
+    *ListQueue* which is a `ListEntry`.
+  * Update the `ListEntry` so that `flag.free == 1`.
+    * Note that the `ListEntry.length` must always be non-zero. If it is zero,
+      then there is an error in the implementation, or the user called an
+      invalid address.
+    * Note also that it is illegal for two instances calling `free(addr)` for
+      the same address. So we shouldn't have to use a compare/exchange.
+* The next step is to iterate over the *ListQueue* updating the tail of the
+  *BufferQueue* T<sub>B</sub> and the length L<sub>B</sub> as the *ListQueue* is
+  enumerated.
+  * From the tail of *ListQueue*, get the *ListEntry*
   * If it is ZERO, or `flag.free == 0` (the test should be equivalent), then
-    exit the loop. The entry remains only marked as free for now, but is not yet
-    available for reallocation.
+    exit the loop. If it is ZERO, it is either being allocated or freed by
+    another thread. If only `flag.free == 0` then it is in use.
   * If `flag.free == 1` there are two cases: there's buffer, or there's no
     buffer *block*.
     * If `length == 0`, this was a failed allocation, and we can now reuse the
@@ -356,26 +363,27 @@ Given an address, which is returned by `alloc(size)`:
       * If the `ListEntry` changed until now, then another `free()` is running
         at the same time and we can exit in this thread, allowing the other
         thread to continue the operation.
-    * Else, if `length != 0`, we must calculate the new tail for *Buffer*.
+    * Else, if `length != 0`, we must calculate the new tail for *BufferQueue*.
       * Do an atomic change of the `ListEntry` to ZERO. If the value changed
         from the initial value by the time this is done, it means another thread
         is freeing the block and exit the loop. Otherwise, it now appears that
         it is in use, and any other free operation will see this and exit
-        instead, allowing us to now properly update the tail of *Buffer*. The
-        tail and the length of the *List* has not yet been updated.
+        instead, allowing us to now properly update the tail of *BufferQueue*.
+        The tail and the length of the *ListQueue* has not yet been updated.
       * In the list entry before setting to zero, we have the offset into the
         buffer.
-        * Take the offset into *Buffer* and get the `BufferBlock`. It contains
-          the Length and the index.
+        * Take the offset into *BufferQueue* and get the `BufferBlock`. It
+          contains the Length and the index.
         * If the `ListEntry.offset` (before it was changed to zero) is the same
-          as the tail of the *Buffer*, we now atomically update the
-          `buffer_queue` by moving the tail forward the
-          `BufferBlock.block_length`.
+          as the tail of the *BufferQueue*, we now atomically update the
+          `buffer_queue` by moving the tail forward and reducing the length by
+          `BufferBlock.block_length`
           * If the initial value of `buffer_queue` is different to the time it
             is being changed, recalculate (as an allocation routine has occurred
-            in parallel on another thread).
-          * An alloc that occurs at the same time can now claim this new memory
-            region
+            in parallel on another thread, the tail remains constant, but the
+            length is expected to change).
+          * An new allocation can now potentially allocate the memory while a
+            free is still in progress.
           * From the old `BufferBlock.block_length` we just freed, get the next
             `BufferBlock` and read it. If the `list_entry_offset` is -1, then
             this block can also be freed. Continue this step as many times as
@@ -389,7 +397,18 @@ Given an address, which is returned by `alloc(size)`:
             another thread. Recalculate based on the new information and try
             again.
         * Else, if the `ListEntry.offset` is not the same as the tail, we can't
-          free memory from *Buffer* yet. As we will remove the index entry, do
-          an atomic change of the *block* `list_entry_offset` to be -1. This
+          free memory from *BufferQueue* yet. As we will remove the index entry,
+          do an atomic change of the *block* `list_entry_offset` to be -1. This
           allows another call to `free()` later to release allow the buffers to
           be reused when all buffers prior are now free.
+          * Now if another `free` saw the *block*, it would notice the
+            `list_entry_offset` is -1, and will automatically free.
+          * Because the block is no longer associated with the `ListEntry`, the
+            element must be atomically updated that the `flag.free` is set to 1
+            and the `ListEntry.length` must be set to zero.
+    * The single loop is completed. The `ListQueue` should have the tail
+      incremented and the length decremented atomically. If the value has
+      changed since, that is because there is an ongoing allocation and it needs
+      to be recalculated. If there is a second `free` simultaneously, one of the
+      threads would exit, depending on which thread won the race to set the
+      entry to ZERO while it was still allocated.
